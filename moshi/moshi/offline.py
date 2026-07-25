@@ -568,6 +568,27 @@ class ServerState:
                 self.stt_mimi = stt_info.get_mimi(device=device)
                 stt_lm = stt_info.get_moshi(device=device, dtype=torch.bfloat16)
                 stt_lm.eval()
+
+                # Sanity-check the codebook math BEFORE wrapping in LMGen / reaching warmup(): the
+                # STT model's config-driven architecture (CheckpointInfo._lm_kwargs, built from a
+                # whitelisted overlay of raw_config onto the fixed PersonaPlex defaults, since this
+                # repo doesn't have ground truth for the STT repo's own config schema) must produce
+                # an input-codebook count that matches what stt_mimi actually encodes per frame, or
+                # every stt_lm_gen.step() call fails an assertion inside prepare_step_input. warmup()
+                # runs with no exception handling in main() and would take the entire server down —
+                # catching a bad architecture guess here keeps it contained to "RAG disabled" instead.
+                AUDIO_TOKENS_PER_STREAM = 8  # moshi/moshi/models/lm.py -- fixed architectural constant
+                needed_tokens = stt_lm.num_codebooks - AUDIO_TOKENS_PER_STREAM - 1
+                if needed_tokens != self.stt_mimi.num_codebooks:
+                    raise RuntimeError(
+                        f"STT model/codec codebook mismatch: the reconstructed LMModel expects "
+                        f"{needed_tokens} input codebooks per step (n_q={stt_lm.n_q}), but the STT "
+                        f"Mimi encoder produces {self.stt_mimi.num_codebooks}. CheckpointInfo's "
+                        f"config-driven architecture guess doesn't match {stt_hf_repo}'s real "
+                        f"architecture — see CheckpointInfo._lm_kwargs in "
+                        f"moshi/moshi/models/loaders.py."
+                    )
+
                 self.stt_lm_gen = moshi.models.LMGen(stt_lm, device=device, temp=0, temp_text=0.0)
                 self.stt_lm_gen.streaming_forever(1)
                 self.stt_mimi.streaming_forever(1)
@@ -679,9 +700,24 @@ class ServerState:
             codes = self.mimi.encode(chunk)
             _ = self.other_mimi.encode(chunk)
 
+            # This runs with no exception handling above it in main() (state.gpu_executor.submit(
+            # state.warmup).result()) -- an uncaught error here takes the entire server process down,
+            # including the main conversational model that already loaded fine. The STT path is
+            # reconstructed from a config-driven architecture guess (see the codebook sanity check in
+            # __init__) that's inherently less certain than the fixed main-model path, so guard it
+            # specifically: any failure here disables RAG for the rest of the process instead of
+            # crashing everything.
             if self.stt_mimi is not None and self.stt_lm_gen is not None:
-                stt_codes = self.stt_mimi.encode(chunk)
-                _ = self.stt_lm_gen.step(input_tokens=stt_codes)
+                try:
+                    stt_codes = self.stt_mimi.encode(chunk)
+                    _ = self.stt_lm_gen.step(input_tokens=stt_codes)
+                except Exception as e:
+                    logger.error(f"RAG disabled — STT warmup failed: {e}")
+                    self.rag_enabled = False
+                    self.stt_mimi = None
+                    self.stt_lm_gen = None
+                    if self.device.type == "cuda":
+                        torch.cuda.empty_cache()
 
             for c in range(codes.shape[-1]):
                 tokens = self.lm_gen.step(codes[:, :, c: c + 1])
