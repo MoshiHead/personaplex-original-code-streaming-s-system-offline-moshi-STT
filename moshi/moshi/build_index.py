@@ -48,7 +48,6 @@ from typing import Optional
 import numpy as np
 import torch
 import sentencepiece
-import soundfile as sf
 import sphn
 from huggingface_hub import hf_hub_download
 
@@ -213,7 +212,11 @@ def split_into_chunks(text: str, max_words: int = 30) -> list[str]:
 # ── TTS ───────────────────────────────────────────────────────────────────────
 
 def text_to_audio(text: str, sample_rate: int) -> np.ndarray:
+    # Deferred: only --mode semantic reaches this function, and only that mode needs pyttsx3/soundfile
+    # installed. Importing them at module level would make --mode text (what offline.py's RAG actually
+    # uses) require two audio/TTS packages it never touches.
     import pyttsx3
+    import soundfile as sf
     engine = pyttsx3.init()
     engine.setProperty('rate', 150)
 
