@@ -581,6 +581,15 @@ class ServerState:
             except Exception as e:
                 logger.error(f"RAG disabled — STT model load failed: {e}")
                 self.rag_enabled = False
+                self.stt_mimi = None
+                self.stt_lm_gen = None
+                # A failed load can still have pulled a partial checkpoint's worth of tensors onto
+                # the GPU before hitting the error (e.g. state_dict entries assigned into the model
+                # before a later shape/device mismatch). Free that back to the allocator now rather
+                # than letting it sit as unusable reserved memory for the rest of this long-lived
+                # server process.
+                if torch.device(device).type == "cuda":
+                    torch.cuda.empty_cache()
 
         if self.rag_enabled:
             try:
@@ -804,6 +813,28 @@ class ServerState:
 
             listening = False
             loop = asyncio.get_event_loop()
+
+            if not transcript.strip():
+                # No real transcript to ground on -- either STT isn't running (RAG disabled/failed
+                # to load) or STT decoded nothing. retrieve_chunks() already no-ops safely on an
+                # empty transcript, but web_search_query() does not (it would fire a real search
+                # with an empty query string), so bail out to the plain conversational path before
+                # either one runs.
+                clog.log("info", "no transcript available — plain conversational turn")
+                t0 = time.monotonic()
+                await loop.run_in_executor(
+                    gpu_executor,
+                    lambda: self._step_silence_frames_sync(
+                        self.pre_ref_silence_frames + self.post_ref_silence_frames
+                    ),
+                )
+                n_boundary_frames = self.pre_ref_silence_frames + self.post_ref_silence_frames
+                silent_frame = np.zeros(self.frame_size, dtype=np.float32)
+                for _ in range(n_boundary_frames):
+                    opus_writer.append_pcm(silent_frame)
+                generating = True
+                current_transcript = transcript
+                return
 
             def _retrieve():
                 return retrieve_chunks_hierarchical(
@@ -1047,11 +1078,10 @@ class ServerState:
                             def _listen_step():
                                 input_codes = self.mimi.encode(chunk_tensor)
                                 _ = self.other_mimi.encode(chunk_tensor)
-                                stt_res = None
+                                stt_tokens = None
                                 if self.rag_enabled and self.stt_lm_gen is not None:
                                     stt_codes = self.stt_mimi.encode(chunk_tensor)
                                     stt_tokens = self.stt_lm_gen.step(input_tokens=stt_codes)
-                                    stt_res = (stt_tokens, self._pcm_silence_score(chunk_pcm))
 
                                 _ = self.lm_gen.step(
                                     input_tokens=input_codes,
@@ -1059,10 +1089,10 @@ class ServerState:
                                     text_token=self.lm_gen.zero_text_code,
                                 )
 
-                                return input_codes, stt_res
+                                return input_codes, stt_tokens
 
                             t_step0 = time.monotonic()
-                            input_codes, stt_result = await loop.run_in_executor(gpu_executor, _listen_step)
+                            input_codes, stt_tokens = await loop.run_in_executor(gpu_executor, _listen_step)
                             t_step_dt = time.monotonic() - t_step0
                             if t_step_dt > frame_budget_s:
                                 clog.log("warning",
@@ -1074,35 +1104,51 @@ class ServerState:
                             # from the live step() call happening as part
                             # of normal generation once the turn resumes.
 
-                            if stt_result is not None:
-                                stt_tokens, vad_score = stt_result
-                                if stt_tokens is not None:
-                                    stt_token_buffer.append(stt_tokens[:, :1, :].cpu())
-                                    text_token = stt_tokens[0, 0, 0].item()
-                                    if text_token not in (0, 3):
-                                        stt_in_utterance = True
-                                        stt_last_vad_end = False
-                                if vad_score > self.vad_threshold:
-                                    stt_silence_frame_count += 1
-                                else:
-                                    stt_silence_frame_count = 0
-                                vad_fired = (
-                                    stt_silence_frame_count >= VAD_SILENCE_FRAMES_REQUIRED
-                                    and not stt_last_vad_end
-                                )
-                                stt_last_vad_end = stt_silence_frame_count >= VAD_SILENCE_FRAMES_REQUIRED
-                                if vad_fired and stt_in_utterance and stt_token_buffer:
+                            # Turn-detection VAD: audio-energy based (ServerState._pcm_silence_score), so
+                            # it runs on every listening frame regardless of whether RAG/STT loaded. This
+                            # used to live entirely inside `if stt_result is not None`, which meant the
+                            # session never left `listening` -- never responded to anything -- whenever RAG
+                            # was disabled or failed to load, since that block was the only path that ever
+                            # called start_rag_turn(). STT tokens (when available) are still buffered for a
+                            # real transcript; without them the turn still ends correctly, just with an
+                            # empty transcript (start_rag_turn/retrieve_chunks treat that as a no-op RAG
+                            # lookup, i.e. a plain conversational turn).
+                            vad_score = self._pcm_silence_score(chunk_pcm)
+                            if stt_tokens is not None:
+                                stt_token_buffer.append(stt_tokens[:, :1, :].cpu())
+                            if vad_score < self.vad_threshold:
+                                stt_in_utterance = True
+                                stt_last_vad_end = False
+
+                            if vad_score > self.vad_threshold:
+                                stt_silence_frame_count += 1
+                            else:
+                                stt_silence_frame_count = 0
+                            vad_fired = (
+                                stt_silence_frame_count >= VAD_SILENCE_FRAMES_REQUIRED
+                                and not stt_last_vad_end
+                            )
+                            stt_last_vad_end = stt_silence_frame_count >= VAD_SILENCE_FRAMES_REQUIRED
+                            if vad_fired and stt_in_utterance:
+                                transcript = ""
+                                if stt_token_buffer:
                                     transcript = decode_stt_tokens(
                                         stt_token_buffer, self.stt_tokenizer, self.stt_padding_token_id
                                     )
-                                    stt_token_buffer = []
-                                    stt_in_utterance = False
-                                    stt_silence_frame_count = 0
-                                    if transcript.strip():
-                                        if self.stt_lm_gen is not None:
-                                            self.stt_lm_gen.reset_streaming()
-                                            self.stt_mimi.reset_streaming()
-                                        asyncio.create_task(start_rag_turn(transcript))
+                                stt_token_buffer = []
+                                stt_in_utterance = False
+                                stt_silence_frame_count = 0
+                                if self.stt_lm_gen is not None:
+                                    self.stt_lm_gen.reset_streaming()
+                                    self.stt_mimi.reset_streaming()
+
+                                # With STT running, an empty decode after a VAD trigger usually means
+                                # background noise tripped the energy threshold rather than real speech --
+                                # skip responding and keep listening. Without STT (no transcript signal to
+                                # sanity-check against), the energy VAD is the only signal available, so
+                                # always respond once it fires.
+                                if transcript.strip() or self.stt_lm_gen is None:
+                                    asyncio.create_task(start_rag_turn(transcript))
 
                             silent_pcm = np.zeros(self.frame_size, dtype=np.float32)
                             opus_writer.append_pcm(silent_pcm)
@@ -1117,20 +1163,19 @@ class ServerState:
                             def _step_and_decode():
                                 input_codes = self.mimi.encode(chunk_tensor)
                                 _ = self.other_mimi.encode(chunk_tensor)
-                                stt_res = None
+                                stt_tokens = None
                                 if self.rag_enabled and self.stt_lm_gen is not None:
                                     stt_codes = self.stt_mimi.encode(chunk_tensor)
                                     stt_tokens = self.stt_lm_gen.step(input_tokens=stt_codes)
-                                    stt_res = (stt_tokens, self._pcm_silence_score(chunk_pcm))
                                 tokens = self.lm_gen.step(input_codes)
                                 if tokens is not None:
                                     main_pcm = self.mimi.decode(tokens[:, 1:9])
                                     _ = self.other_mimi.decode(tokens[:, 1:9])
-                                    return tokens, main_pcm.cpu(), input_codes, stt_res
-                                return None, None, input_codes, stt_res
+                                    return tokens, main_pcm.cpu(), input_codes, stt_tokens
+                                return None, None, input_codes, stt_tokens
 
                             t_step0 = time.monotonic()
-                            tokens, main_pcm, input_codes, stt_result = await loop.run_in_executor(
+                            tokens, main_pcm, input_codes, stt_tokens = await loop.run_in_executor(
                                 gpu_executor, _step_and_decode
                             )
                             t_step_dt = time.monotonic() - t_step0
@@ -1139,16 +1184,18 @@ class ServerState:
                                     f"STEP OVERRUN (generate): {t_step_dt*1000:.1f}ms "
                                     f"(budget {frame_budget_s*1000:.1f}ms)")
 
-                            # Barge-in detection — UNCHANGED except for the
-                            # removed empty_cache() call, see below.
-                            speech_this_frame = False
-                            if stt_result is not None:
-                                stt_tokens, vad_score_bi = stt_result
-                                if stt_tokens is not None:
-                                    stt_text_token = stt_tokens[0, 0, 0].item()
-                                    if (stt_text_token not in (0, 3)
-                                            and vad_score_bi < self.vad_threshold):
-                                        speech_this_frame = True
+                            # Barge-in detection: energy VAD always runs (so barge-in still works when
+                            # RAG/STT is disabled or failed to load); when STT tokens are also available,
+                            # require both signals to agree, same as before, to avoid false positives from
+                            # background noise alone.
+                            vad_score_bi = self._pcm_silence_score(chunk_pcm)
+                            if stt_tokens is not None:
+                                stt_text_token = stt_tokens[0, 0, 0].item()
+                                speech_this_frame = (
+                                    stt_text_token not in (0, 3) and vad_score_bi < self.vad_threshold
+                                )
+                            else:
+                                speech_this_frame = vad_score_bi < self.vad_threshold
 
                             if speech_this_frame:
                                 barge_in_frame_count += 1

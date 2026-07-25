@@ -270,6 +270,23 @@ def get_moshi_lm(
         state_dict[key] = state_dict[key].to(device=dev, dtype=dtype)
     
     model.load_state_dict(state_dict, strict=False, assign=True)
+
+    # With assign=True, load_state_dict only replaces parameters/buffers whose name matched a
+    # state_dict key -- anything unmatched is still the meta tensor it was constructed with above
+    # (empty, no storage). .to() can't move a meta tensor ("no data to copy"), so it would crash
+    # here instead of the (expected, already-logged-as-an-error) case of a checkpoint that doesn't
+    # cover every parameter the constructed LMModel expects -- e.g. copy_missing_weights=False in
+    # CheckpointInfo.get_moshi, used for auxiliary checkpoints like the STT model, which
+    # intentionally skips the PersonaPlex-specific "fill missing keys" patch above. Zero-fill any
+    # leftover meta tensors in place so loading degrades (uncovered weights start at zero) instead
+    # of crashing after already having pulled the whole checkpoint onto the GPU.
+    for name, param in model.named_parameters():
+        if param.is_meta:
+            param.data = torch.zeros(param.shape, dtype=param.dtype, device=dev)
+    for name, buf in model.named_buffers():
+        if buf.is_meta:
+            buf.data = torch.zeros(buf.shape, dtype=buf.dtype, device=dev)
+
     model.eval()
     return model.to(device=device, dtype=dtype)
 
