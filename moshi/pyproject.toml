@@ -31,6 +31,14 @@ readme = "README.md"
 moshi-server = "moshi.server:main"
 moshi-offline = "moshi.offline:main"
 
+[tool.setuptools.packages.find]
+# Without this, setuptools' flat-layout auto-discovery sees `moshi/lora/` (the LoRA adapter directory,
+# a sibling of `moshi/moshi/` under this pyproject.toml's root) as a second top-level package named "lora"
+# and refuses to build at all ("Multiple top-level packages discovered in a flat-layout: ['lora', 'moshi']").
+# Restricting discovery to the moshi* family excludes lora/ (and any other non-package directory that might
+# show up here later, e.g. checkpoints/) without needing to enumerate submodules by hand.
+include = ["moshi*"]
+
 [tool.setuptools.dynamic]
 version = {attr = "moshi.__version__"}
 
