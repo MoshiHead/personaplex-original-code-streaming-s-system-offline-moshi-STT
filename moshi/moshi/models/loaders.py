@@ -273,19 +273,27 @@ def get_moshi_lm(
 
     # With assign=True, load_state_dict only replaces parameters/buffers whose name matched a
     # state_dict key -- anything unmatched is still the meta tensor it was constructed with above
-    # (empty, no storage). .to() can't move a meta tensor ("no data to copy"), so it would crash
-    # here instead of the (expected, already-logged-as-an-error) case of a checkpoint that doesn't
+    # (empty, no storage). Neither .to() nor a plain `.data = real_tensor` reassignment can move a
+    # meta tensor (the latter raises "Attempted to call variable.set_data(tensor), but variable and
+    # tensor have incompatible tensor type" -- meta participates in a different dispatch key set
+    # that the .data setter's compatibility check rejects, same underlying reason .to() fails).
+    # This matters for the (expected, already-logged-as-an-error) case of a checkpoint that doesn't
     # cover every parameter the constructed LMModel expects -- e.g. copy_missing_weights=False in
     # CheckpointInfo.get_moshi, used for auxiliary checkpoints like the STT model, which
-    # intentionally skips the PersonaPlex-specific "fill missing keys" patch above. Zero-fill any
-    # leftover meta tensors in place so loading degrades (uncovered weights start at zero) instead
-    # of crashing after already having pulled the whole checkpoint onto the GPU.
-    for name, param in model.named_parameters():
-        if param.is_meta:
-            param.data = torch.zeros(param.shape, dtype=param.dtype, device=dev)
-    for name, buf in model.named_buffers():
-        if buf.is_meta:
-            buf.data = torch.zeros(buf.shape, dtype=buf.dtype, device=dev)
+    # intentionally skips the PersonaPlex-specific "fill missing keys" patch above. Replace any
+    # leftover meta parameters/buffers in place on their owning module (not through the .data
+    # setter) so loading degrades (uncovered weights start at zero) instead of crashing after
+    # already having pulled the whole checkpoint onto the GPU.
+    for submodule in model.modules():
+        for name, param in list(submodule._parameters.items()):
+            if param is not None and param.is_meta:
+                submodule._parameters[name] = torch.nn.Parameter(
+                    torch.zeros(param.shape, dtype=param.dtype, device=dev),
+                    requires_grad=param.requires_grad,
+                )
+        for name, buf in list(submodule._buffers.items()):
+            if buf is not None and buf.is_meta:
+                submodule._buffers[name] = torch.zeros(buf.shape, dtype=buf.dtype, device=dev)
 
     model.eval()
     return model.to(device=device, dtype=dtype)
